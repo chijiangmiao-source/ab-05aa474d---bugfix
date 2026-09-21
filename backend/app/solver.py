@@ -45,74 +45,40 @@ def build_candidates(
     """Return ``(patterns, cover_bits, costs)`` for every useful filter.
 
     A candidate accepts at least one allowed identifier and no forbidden
-    identifier.  For each distinct subset of covered allowed identifiers we
-    keep only the filter with minimum accepted-identifier cost, breaking
-    ties toward the lexicographically smaller ``(mask, code)``: every other
-    filter with the same coverage is worse on objective 4 (or 5).
+    identifier.  We enumerate *all* ``2**ID_BITS`` masks: for each mask the
+    allowed identifiers are bucketed by their projected code ``x & mask``,
+    and a bucket is dropped when any forbidden identifier projects to the
+    same code (that filter would hit it).  This is exhaustive -- every
+    sub-cube pattern is considered at exactly one mask, and any filter that
+    covers a set of allowed ids is the bucket of that mask.  In particular
+    multi-bit mask relaxations are not missed by a single-bit closure.
+
+    For each distinct subset of covered allowed identifiers we keep only the
+    filter with minimum accepted-identifier cost, breaking ties toward the
+    lexicographically smaller ``(mask, code)``: every other filter with the
+    same coverage is worse on objective 4 (or 5).
     """
     allowed = sorted(allowed)
     index_of = {x: i for i, x in enumerate(allowed)}
     forbidden = tuple(forbidden)
 
-    def hull(values: Sequence[int]) -> Pattern:
-        common_ones = FULL_ID_MASK
-        common_zeroes = FULL_ID_MASK
-        for value in values:
-            common_ones &= value
-            common_zeroes &= ~value
-        mask = (common_ones | common_zeroes) & FULL_ID_MASK
-        return mask, common_ones & mask
-
-    def cover_for(pattern: Pattern) -> int:
-        mask, code = pattern
-        cover = 0
-        for value in allowed:
-            if (value & mask) == code:
-                cover |= 1 << index_of[value]
-        return cover
-
-    def safe(pattern: Pattern) -> bool:
-        mask, code = pattern
-        return all((value & mask) != code for value in forbidden)
-
-    seeds: Dict[Pattern, int] = {}
-    for value in allowed:
-        seeds[(FULL_ID_MASK, value)] = 1 << index_of[value]
-    for left in range(len(allowed)):
-        for right in range(left + 1, len(allowed)):
-            pattern = hull((allowed[left], allowed[right]))
-            if safe(pattern):
-                seeds[pattern] = cover_for(pattern)
-    overall = hull(allowed)
-    if safe(overall):
-        seeds[overall] = cover_for(overall)
-
-    candidates = dict(seeds)
-    frontier = dict(seeds)
-    while frontier:
-        generated: Dict[Pattern, int] = {}
-        grouped: Dict[int, List[Pattern]] = {}
-        for pattern in frontier:
-            grouped.setdefault(pattern[0], []).append(pattern)
-        for mask, patterns_at_mask in grouped.items():
-            for left in range(len(patterns_at_mask)):
-                for right in range(left + 1, len(patterns_at_mask)):
-                    difference = (patterns_at_mask[left][1] ^ patterns_at_mask[right][1]) & mask
-                    if difference == 0 or difference & (difference - 1):
-                        continue
-                    merged_mask = mask & ~difference
-                    merged = (merged_mask, patterns_at_mask[left][1] & merged_mask)
-                    if merged not in candidates and safe(merged):
-                        generated[merged] = cover_for(merged)
-        candidates.update(generated)
-        frontier = generated
-
     best: Dict[int, Tuple[int, Pattern]] = {}
-    for pat, cover in candidates.items():
-        cost = ID_MAX >> pat[0].bit_count()
-        old = best.get(cover)
-        if old is None or (cost, pat) < old:
-            best[cover] = (cost, pat)
+    for mask in range(ID_MAX):
+        # Codes that would accept at least one forbidden identifier.
+        blocked_codes = {y & mask for y in forbidden}
+        cost = ID_MAX >> mask.bit_count()
+        # code -> covered-allowed bit set.
+        buckets: Dict[int, int] = {}
+        for value in allowed:
+            code = value & mask
+            if code in blocked_codes:
+                continue
+            buckets[code] = buckets.get(code, 0) | (1 << index_of[value])
+        for code, cover in buckets.items():
+            pattern: Pattern = (mask, code)
+            old = best.get(cover)
+            if old is None or (cost, pattern) < old:
+                best[cover] = (cost, pattern)
 
     items = sorted(
         ((pat, cover, cost) for cover, (cost, pat) in best.items()),
